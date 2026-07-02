@@ -11,7 +11,8 @@ from feeluown.ai.copilot import CopilotArtifact
 from feeluown.gui.helpers import secondary_text_color
 from feeluown.library import BriefSongModel
 from feeluown.media import Media
-from feeluown.player import PlaybackMode, PlaylistMode
+from feeluown.player import PlaybackMode, PlaylistMode, State
+from feeluown.player.lyric import Line
 from feeluown.utils.dispatch import Signal
 from feeluown.gui.components.player_playlist import (
     PlayerPlaylistView,
@@ -25,6 +26,19 @@ from feeluown.gui.uimain.ai_chat import (
     create_aichat_overlay,
     parse_song_link,
     parse_song_link_info,
+)
+from feeluown.gui.uimain.dynamic_island_bar import (
+    COMPACT_MIN_WIDTH,
+    CONTENT_SPACING,
+    COVER_COMPACT,
+    COVER_EXPANDED,
+    ISLAND_HEIGHT,
+    PADDING_LEFT,
+    PADDING_RIGHT,
+    SEEK_STEP,
+    DynamicIslandStatusBar,
+    EXPANDED_WIDTH,
+    VOLUME_STEP,
 )
 from feeluown.gui.uimain.playlist_overlay import PlaylistOverlay
 from feeluown.gui.widgets.ai_chat import (
@@ -312,7 +326,10 @@ def test_ai_chat_overlay_is_app_fullscreen(qtbot, app_mock):
     assert overlay.layout().contentsMargins().right() == 0
     assert overlay.layout().contentsMargins().bottom() == 0
     assert overlay.body._header.text() == "AI Assistant"
-    assert not overlay.body._radio_status_label.isVisible()
+    island = overlay.body._chat_box._dynamic_island
+    assert island.parent() is overlay.body._chat_box.input_widget
+    assert overlay.body._toolbar_layout.indexOf(island) == -1
+    assert not island.isVisible()
     assert not overlay.body._sidebar_panel.isVisible()
     assert isinstance(overlay.body._new_thread_btn, TextButton)
     assert isinstance(overlay.body._sidebar_btn, TextButton)
@@ -336,7 +353,7 @@ def test_ai_chat_keeps_assistant_header_when_ai_radio_is_active(qtbot, app_mock)
     overlay.show()
 
     assert overlay.body._header.text() == "AI Assistant"
-    assert overlay.body._radio_status_label.isVisibleTo(overlay.body)
+    assert overlay.body._chat_box._dynamic_island.isHidden()
     assert overlay.body._new_thread_btn.isVisibleTo(overlay.body)
     assert overlay.body._sidebar_btn.isVisibleTo(overlay.body)
     assert overlay.body._collapse_btn.isVisibleTo(overlay.body)
@@ -661,6 +678,7 @@ def test_ai_chat_refreshes_palette_roles(qtbot, app_mock):
         assert not overlay.body._playlist_sidebar.viewport().autoFillBackground()
         assert input_widget._msg_label.textFormat() == Qt.TextFormat.PlainText
         assert input_widget._msg_label.text() == "AI Radio is active"
+        assert input_widget._msg_label.isHidden()
         assert "color:" not in input_widget._msg_label.text()
         assert input_widget._msg_label.palette().color(
             input_widget._msg_label.palette().ColorRole.WindowText
@@ -674,9 +692,12 @@ def test_ai_chat_refreshes_palette_roles(qtbot, app_mock):
         assert tool_card._label.palette().color(
             tool_card._label.palette().ColorRole.WindowText
         ) == secondary_text_color(dark_palette)
-        assert overlay.body._radio_status_label.palette().color(
-            overlay.body._radio_status_label.palette().ColorRole.WindowText
-        ) == secondary_text_color(dark_palette)
+        island = overlay.body._chat_box._dynamic_island
+        assert island.parent() is input_widget
+        island_pal = island.palette()
+        assert island_pal.color(
+            island_pal.ColorRole.WindowText
+        ) == dark_palette.color(dark_palette.ColorRole.WindowText)
         border_color = surface_border_color(dark_palette, QPalette.ColorRole.Base)
         assert border_color.alpha() > 0
         assert border_color != dark_palette.color(dark_palette.ColorRole.Mid)
@@ -754,6 +775,234 @@ def test_ai_chat_theme_change_reapplies_self_painted_palettes(qtbot, app_mock):
         )
     finally:
         QGuiApplication.setPalette(original_palette)
+
+
+def _prepare_dynamic_island_app(app_mock):
+    app_mock.player.metadata_changed = Signal()
+    app_mock.player.state_changed = Signal()
+    app_mock.player.volume_changed = Signal()
+    app_mock.player.position_changed = Signal()
+    app_mock.player.duration_changed = Signal()
+    app_mock.player.state = State.playing
+    app_mock.player.current_metadata = {}
+    app_mock.player.position = 20
+    app_mock.player.duration = 100
+    app_mock.player.volume = 50
+    app_mock.live_lyric.line_changed = Signal()
+    app_mock.live_lyric.current_line = Line("", "", False)
+    app_mock.playlist.play_model_stage_changed = Signal()
+    return app_mock
+
+
+def test_dynamic_island_keeps_height_when_expanded(qtbot, app_mock):
+    _prepare_dynamic_island_app(app_mock)
+    island = DynamicIslandStatusBar(app_mock)
+    qtbot.addWidget(island)
+
+    island._on_metadata_changed(
+        {
+            "title": "Hi",
+            "artists": ["Mary"],
+            "artwork": "",
+            "source": "fake",
+        }
+    )
+    compact_height = island.height()
+    compact_width = island.width()
+
+    island._start_expand()
+    while island._animating:
+        island._tick_animation()
+
+    assert compact_height == ISLAND_HEIGHT
+    assert island.height() == compact_height
+    assert island.width() == EXPANDED_WIDTH
+    assert compact_width >= COMPACT_MIN_WIDTH
+    assert island._cover.width() == COVER_EXPANDED
+    assert island._cover.height() == COVER_EXPANDED
+
+
+def test_dynamic_island_syncs_current_cover_and_lyric_on_init(
+    qtbot, app_mock, monkeypatch
+):
+    _prepare_dynamic_island_app(app_mock)
+    app_mock.player.current_metadata = {
+        "title": "Song",
+        "artists": ["Mary"],
+        "artwork": "http://example.test/cover.jpg",
+        "source": "fake",
+        "uri": "fuo://fake/songs/1",
+    }
+    app_mock.live_lyric.current_line = Line("Current lyric", "", False)
+    calls = []
+    monkeypatch.setattr(
+        "feeluown.gui.uimain.dynamic_island_bar.run_afn",
+        lambda *args: calls.append(args),
+    )
+
+    island = DynamicIslandStatusBar(app_mock)
+    qtbot.addWidget(island)
+
+    assert calls == [
+        (
+            island._cover.show_cover_with_source,
+            "http://example.test/cover.jpg",
+            "fake",
+            "fuo://fake/songs/1",
+        )
+    ]
+    assert island._lyric_label.text() == "Current lyric"
+    assert island._cover.width() == COVER_COMPACT
+    assert island._cover.height() == COVER_COMPACT
+
+
+def test_dynamic_island_metadata_does_not_replace_compact_lyric(qtbot, app_mock):
+    _prepare_dynamic_island_app(app_mock)
+    island = DynamicIslandStatusBar(app_mock)
+    qtbot.addWidget(island)
+
+    island._on_lyric_line_changed(Line("Stay as lyric", "", False))
+    island._on_metadata_changed(
+        {
+            "title": "Song title",
+            "artists": ["Mary"],
+            "artwork": "",
+            "source": "fake",
+        }
+    )
+
+    assert island._lyric_label.toolTip() == "Stay as lyric"
+    assert island._lyric_label.alignment() == Qt.AlignmentFlag.AlignCenter
+
+
+def test_dynamic_island_compact_lyric_has_width_padding(qtbot, app_mock):
+    _prepare_dynamic_island_app(app_mock)
+    island = DynamicIslandStatusBar(app_mock)
+    qtbot.addWidget(island)
+
+    island._on_lyric_line_changed(Line("abc", "", False))
+
+    assert island._lyric_label.width() > (
+        island._lyric_label.fontMetrics().horizontalAdvance("abc")
+    )
+    assert island._lyric_label.text() == "abc"
+
+
+def test_dynamic_island_compact_right_padding_matches_cover_left(qtbot, app_mock):
+    _prepare_dynamic_island_app(app_mock)
+    island = DynamicIslandStatusBar(app_mock)
+    qtbot.addWidget(island)
+
+    island._on_lyric_line_changed(Line("padding check lyric", "", False))
+
+    assert PADDING_RIGHT == PADDING_LEFT
+    assert island.width() == (
+        PADDING_LEFT + COVER_COMPACT + CONTENT_SPACING +
+        island._lyric_label.width() + PADDING_RIGHT
+    )
+
+
+def test_dynamic_island_compact_width_tracks_lyric(qtbot, app_mock):
+    _prepare_dynamic_island_app(app_mock)
+    island = DynamicIslandStatusBar(app_mock)
+    qtbot.addWidget(island)
+
+    island._on_lyric_line_changed(Line("short", "", False))
+    short_width = island.width()
+    island._on_lyric_line_changed(
+        Line(
+            (
+                "This is a fairly long lyric line that should be elided "
+                "inside the island"
+            ),
+            "",
+            False,
+        )
+    )
+
+    assert short_width >= COMPACT_MIN_WIDTH
+    assert short_width < island.width()
+    assert island.width() == EXPANDED_WIDTH
+    assert island._lyric_label.width() == island._compact_text_max_width()
+    assert island._lyric_label.alignment() == Qt.AlignmentFlag.AlignCenter
+
+
+def test_dynamic_island_restores_current_lyric_after_hover(qtbot, app_mock):
+    _prepare_dynamic_island_app(app_mock)
+    app_mock.player.current_metadata = {
+        "title": "Song",
+        "artists": ["Mary"],
+        "artwork": "",
+        "source": "fake",
+    }
+    app_mock.live_lyric.current_line = Line("Lyric while expanded", "", False)
+    island = DynamicIslandStatusBar(app_mock)
+    qtbot.addWidget(island)
+
+    island._start_expand()
+    while island._animating:
+        island._tick_animation()
+    assert island._song_label.isVisible()
+
+    island._switch_to_compact()
+
+    assert island._lyric_label.toolTip() == "Lyric while expanded"
+    assert island._lyric_label.text().startswith("Lyric while")
+
+
+def test_dynamic_island_keyboard_controls_player(qtbot, app_mock):
+    _prepare_dynamic_island_app(app_mock)
+    island = DynamicIslandStatusBar(app_mock)
+    qtbot.addWidget(island)
+
+    island.keyPressEvent(
+        SimpleNamespace(key=lambda: Qt.Key.Key_Right, accept=lambda: None)
+    )
+    assert app_mock.player.position == 20 + SEEK_STEP
+    island.keyPressEvent(
+        SimpleNamespace(key=lambda: Qt.Key.Key_Left, accept=lambda: None)
+    )
+    assert app_mock.player.position == 20
+    island.keyPressEvent(
+        SimpleNamespace(key=lambda: Qt.Key.Key_Up, accept=lambda: None)
+    )
+    assert app_mock.player.volume == 50 + VOLUME_STEP
+    island.keyPressEvent(
+        SimpleNamespace(key=lambda: Qt.Key.Key_Down, accept=lambda: None)
+    )
+    assert app_mock.player.volume == 50
+
+
+def test_dynamic_island_expanded_controls_include_volume(qtbot, app_mock):
+    _prepare_dynamic_island_app(app_mock)
+    island = DynamicIslandStatusBar(app_mock)
+    qtbot.addWidget(island)
+
+    assert island.focusPolicy() == Qt.FocusPolicy.StrongFocus
+    island._switch_to_expanded()
+    island._volume_btn.setValue(72)
+
+    assert not island._volume_btn.isHidden()
+    assert island._control_widget.layout().indexOf(island._volume_btn) >= 0
+    assert app_mock.player.volume == 72
+
+
+def test_dynamic_island_progress_updates_only_when_expanded(qtbot, app_mock, mocker):
+    _prepare_dynamic_island_app(app_mock)
+    island = DynamicIslandStatusBar(app_mock)
+    qtbot.addWidget(island)
+    update = mocker.patch.object(island, "update")
+
+    assert island._playback_progress() == 0.2
+    island._on_position_changed(50)
+    update.assert_not_called()
+
+    island._switch_to_expanded()
+    update.reset_mock()
+    island._on_duration_changed(200)
+
+    assert island._playback_progress() == 0.25
+    update.assert_called_once()
 
 
 def test_ai_chat_assistant_rows_keep_content_height(qtbot):
@@ -1097,6 +1346,13 @@ def test_ai_chat_overlay_reapplies_titlebar_mode_on_resize(qtbot, app_mock, mock
     app.ai = FakeAI()
     app.ai.radio = None
     app.theme_mgr = FakeThemeManager()
+    # Mock player for LineSongLabel and DynamicIslandStatusBar
+    app.player = app_mock.player
+    app.player.metadata_changed = Signal()
+    app.player.state_changed = Signal()
+    app.player.state = State.stopped
+    app.live_lyric = app_mock.live_lyric
+    app.live_lyric.line_changed = Signal()
     app.playlist = app_mock.playlist
     app.playlist.mode_changed = Signal()
     app.playlist.list.return_value = []
